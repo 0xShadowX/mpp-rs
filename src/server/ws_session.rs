@@ -39,14 +39,14 @@ use time::OffsetDateTime;
 
 use super::ws::{WsMessage, WsResponse};
 use crate::protocol::core::parse_authorization;
-use crate::protocol::methods::tempo::session_method::deduct_from_channel;
+use crate::protocol::methods::tempo::session_method::{deduct_from_channel, ChannelStore};
 use crate::protocol::methods::tempo::session_receipt::SessionReceipt;
-use crate::protocol::traits::{ChargeMethod, SessionMethod};
+use crate::protocol::traits::{ChargeMethod, ErrorCode, SessionMethod};
 
 /// Options for [`ws_session`].
 pub struct WsSessionOptions<G> {
     /// Channel store for balance tracking.
-    pub store: Arc<dyn crate::protocol::methods::tempo::session_method::ChannelStore>,
+    pub store: Arc<dyn ChannelStore>,
     /// Channel ID (hex).
     pub channel_id: String,
     /// Challenge ID for the receipt.
@@ -87,7 +87,7 @@ where
         loop {
             match deduct_from_channel(&*store, &channel_id, tick_cost).await {
                 Ok(_state) => break,
-                Err(_) => {
+                Err(e) if e.code == Some(ErrorCode::InsufficientBalance) => {
                     // Emit needVoucher frame
                     if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
                         let msg = WsResponse::NeedVoucher {
@@ -107,6 +107,12 @@ where
                         _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {},
                     }
                 }
+                Err(_) => {
+                    // Closed, missing, or unreadable channel — no voucher can fix
+                    // that, so emit the final receipt and stop instead of waiting forever.
+                    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
+                    return;
+                }
             }
         }
 
@@ -118,15 +124,27 @@ where
     }
 
     // Emit final session receipt
-    if let Ok(Some(ch)) = store.get_channel(&channel_id).await {
+    send_receipt(sender, &*store, &channel_id, &challenge_id).await;
+}
+
+/// Send the final session receipt for `channel_id`, if the channel still exists.
+async fn send_receipt<S>(
+    sender: &mut S,
+    store: &dyn ChannelStore,
+    channel_id: &str,
+    challenge_id: &str,
+) where
+    S: futures_util::Sink<String> + Unpin,
+{
+    if let Ok(Some(ch)) = store.get_channel(channel_id).await {
         let timestamp = OffsetDateTime::now_utc()
             .format(&Iso8601::DEFAULT)
             .expect("ISO 8601 formatting cannot fail");
 
         let mut receipt = SessionReceipt::new(
             timestamp,
-            &challenge_id,
-            &channel_id,
+            challenge_id,
+            channel_id,
             ch.highest_voucher_amount.to_string(),
             ch.spent.to_string(),
         );
@@ -168,7 +186,170 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::methods::tempo::session_method::InMemoryChannelStore;
+    use crate::protocol::methods::tempo::session_method::{ChannelState, InMemoryChannelStore};
+
+    fn test_channel_state(channel_id: &str, voucher_amount: u128, deposit: u128) -> ChannelState {
+        ChannelState {
+            channel_id: channel_id.to_string(),
+            chain_id: 42431,
+            escrow_contract: "0x5555555555555555555555555555555555555555"
+                .parse()
+                .unwrap(),
+            payer: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            payee: "0x2222222222222222222222222222222222222222"
+                .parse()
+                .unwrap(),
+            token: "0x3333333333333333333333333333333333333333"
+                .parse()
+                .unwrap(),
+            settlement_route: None,
+            authorized_signer: "0x4444444444444444444444444444444444444444"
+                .parse()
+                .unwrap(),
+            deposit,
+            settled_on_chain: 0,
+            highest_voucher_amount: voucher_amount,
+            highest_voucher_signature: None,
+            spent: 0,
+            units: 0,
+            finalized: false,
+            closing: false,
+            close_requested_at: 0,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Sink that records every frame sent over the session.
+    fn recording_sink() -> (
+        impl futures_util::Sink<String, Error = Box<dyn std::error::Error + Send + Sync>> + Send + Unpin,
+        Arc<std::sync::Mutex<Vec<WsResponse>>>,
+    ) {
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_frames = frames.clone();
+        let sink = futures_util::sink::unfold((), move |(), text: String| {
+            let frames = sink_frames.clone();
+            async move {
+                let response: WsResponse = serde_json::from_str(&text)?;
+                frames.lock().unwrap().push(response);
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            }
+        });
+        (Box::pin(sink), frames)
+    }
+
+    #[tokio::test]
+    async fn test_ws_session_finalized_channel_emits_receipt_and_stops() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let channel_id = "0xchannel_ws_finalized";
+        store.insert(channel_id, test_channel_state(channel_id, 1000, 5000));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(10);
+        let generate = Box::pin(async_stream::stream! {
+            while let Some(value) = rx.recv().await {
+                yield value;
+            }
+        });
+
+        let (mut sink, frames) = recording_sink();
+        let session_store = store.clone();
+        let session = tokio::spawn(async move {
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store: session_store,
+                    channel_id: channel_id.to_string(),
+                    challenge_id: "ch-fin".to_string(),
+                    tick_cost: 100,
+                    generate,
+                    poll_interval_ms: 10,
+                },
+            )
+            .await;
+        });
+
+        tx.send("a".to_string()).await.unwrap();
+        tx.send("b".to_string()).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        store
+            .update_channel(
+                channel_id,
+                Box::new(|current: Option<ChannelState>| {
+                    let state = current.unwrap();
+                    Ok(Some(ChannelState {
+                        finalized: true,
+                        ..state
+                    }))
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The next deduction hits ChannelClosed. Without the closed-channel arm the
+        // session loops on needVoucher forever and this join times out.
+        tx.send("c".to_string()).await.unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), session)
+            .await
+            .expect("session must terminate once the channel is finalized")
+            .unwrap();
+
+        let frames = frames.lock().unwrap();
+        let data: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                WsResponse::Data { data } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data, vec!["a", "b"], "no data frame after finalization");
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, WsResponse::NeedVoucher { .. })),
+            "a finalized channel must not request vouchers"
+        );
+
+        match frames.last() {
+            Some(WsResponse::Receipt { receipt }) => {
+                assert_eq!(receipt["challengeId"], "ch-fin");
+                assert_eq!(receipt["channelId"], channel_id);
+                assert_eq!(receipt["spent"], "200");
+                assert_eq!(receipt["units"], 2);
+            }
+            other => panic!("last frame should be a receipt, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_session_missing_channel_stops() {
+        let (mut sink, frames) = recording_sink();
+        let generate = Box::pin(async_stream::stream! {
+            yield "a".to_string();
+        });
+
+        // No voucher can create the channel, so the session must end instead of polling.
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            ws_session(
+                &mut sink,
+                WsSessionOptions {
+                    store: Arc::new(InMemoryChannelStore::new()),
+                    channel_id: "0xchannel_ws_missing".to_string(),
+                    challenge_id: "ch-missing".to_string(),
+                    tick_cost: 100,
+                    generate,
+                    poll_interval_ms: 10,
+                },
+            ),
+        )
+        .await
+        .expect("session must terminate when the channel does not exist");
+
+        let frames = frames.lock().unwrap();
+        assert!(frames.is_empty(), "unexpected frames: {frames:?}");
+    }
 
     #[test]
     fn test_ws_session_options_fields() {

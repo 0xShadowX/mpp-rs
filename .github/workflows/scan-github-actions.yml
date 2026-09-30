@@ -18,7 +18,7 @@ permissions: {}
 jobs:
   scan:
     name: Scan GitHub Actions
-    uses: tempoxyz/gh-actions/.github/workflows/scan-github-actions.yml@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+    uses: tempoxyz/gh-actions/.github/workflows/scan-github-actions.yml@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
     permissions:
       id-token: write
       actions: read
